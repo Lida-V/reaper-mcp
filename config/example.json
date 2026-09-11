@@ -1,0 +1,6 @@
+{
+  "target": {
+    "executable": "C:/Program Files/REAPER (x64)/reaper.exe",
+    "pluginCacheSource": "C:/path/to/initialized/REAPER-resource"
+  }
+}

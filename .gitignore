@@ -1,0 +1,26 @@
+# Never publish machine configuration, generated audio, projects, or transport logs.
+/config/local.json
+/runtime/
+/projects/
+/output/
+/dist/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+*.rpp
+*.rpp-bak
+*.wav
+*.mp3
+*.flac
+*.mid
+*.midi
+*.vstpreset
+*.fxp
+*.fxb
+*.rk
+reaper-reginfo*.ini
+.DS_Store
+Thumbs.db

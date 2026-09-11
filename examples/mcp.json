@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reaper": {
+      "command": "python",
+      "args": ["-X", "utf8", "C:/tools/reaper-mcp/scripts/reaper_mcp.py"]
+    }
+  }
+}

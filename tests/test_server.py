@@ -1,0 +1,130 @@
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+import reaper_api as api
+import reaper_mcp as mcp
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_stdio_recovers_after_invalid_requests(self):
+        messages = [
+            '{bad json',
+            '[]',
+            json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}),
+            json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                        'params': {'protocolVersion': '2099-01-01'}}),
+            json.dumps({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}),
+            json.dumps({'jsonrpc': '2.0', 'id': 3, 'method': 'unsupported'}),
+            json.dumps({'jsonrpc': '2.0', 'id': 4, 'method': 'ping'}),
+        ]
+        run = subprocess.run([sys.executable, '-X', 'utf8', str(ROOT / 'scripts/reaper_mcp.py')],
+                             input='\n'.join(messages) + '\n', capture_output=True,
+                             text=True, encoding='utf-8', timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr, '')
+        replies = [json.loads(line) for line in run.stdout.splitlines()]
+        self.assertEqual(len(replies), 6)
+        self.assertEqual(replies[0]['error']['code'], -32700)
+        self.assertEqual(replies[1]['error']['code'], -32600)
+        self.assertEqual(replies[2]['result']['protocolVersion'], '2024-11-05')
+        self.assertEqual(len(replies[3]['result']['tools']), 5)
+        self.assertEqual(replies[4]['error']['code'], -32601)
+        self.assertEqual(replies[5]['result'], {})
+
+    def test_bad_arguments_never_reach_reaper(self):
+        invalid = [
+            {}, {'code': 42}, {'code': 'return true', 'timeout_seconds': True},
+            {'code': 'return true', 'timeout_seconds': 601},
+            {'code': 'return true', 'timeout_seconds': 0},
+            {'code': 'return true', 'expected_project': 123},
+            {'code': 'return true', 'unexpected': 'x'}, [],
+        ]
+        with patch.object(api, 'run_lua') as run:
+            for args in invalid:
+                with self.subTest(args=args), self.assertRaises(mcp.RpcError):
+                    mcp.call('reaper_run_lua', args)
+            run.assert_not_called()
+
+    def test_execution_error_is_tool_error(self):
+        with patch.object(api, 'run_lua', side_effect=RuntimeError('Unexpected active project')):
+            result = mcp.dispatch({'method': 'tools/call', 'params': {
+                'name': 'reaper_run_lua', 'arguments': {'code': 'return true'}}})
+        self.assertTrue(result['isError'])
+        self.assertIn('Unexpected active project', result['content'][0]['text'])
+
+
+class IsolationTests(unittest.TestCase):
+    def test_startup_scan_disabled_without_changing_other_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resource = root / 'resource'
+            resource.mkdir()
+            ini = resource / 'reaper.ini'
+            ini.write_text('[REAPER]\nvst_scan=2\nvstpath64=C:/Plugins\nother=keep\n[plugin]\nvst_scan=2\n', encoding='utf-8')
+            with patch.object(api, 'RESOURCE', resource), patch.object(api, 'QUEUE', root / 'queue'), \
+                    patch.object(api, 'config', return_value={'target': {}}):
+                api.initialize_resource()
+            self.assertEqual(ini.read_text(), '[REAPER]\nvst_scan=1\nvstpath64=C:/Plugins\nother=keep\n[plugin]\nvst_scan=2\n')
+
+    def test_unprepared_profile_cannot_launch_reaper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resource = root / 'resource'
+            resource.mkdir()
+            (resource / 'reaper-vstplugins64.ini').write_text('[vstcache]\n')
+            with patch.object(api, 'RESOURCE', resource), patch.object(api, 'RUNTIME', root), \
+                    patch.object(api, 'status', return_value={'responsive': False}), \
+                    patch.object(api, 'initialize_resource', return_value=resource / 'reaper.ini'), \
+                    patch.object(api.subprocess, 'Popen') as launch, self.assertRaisesRegex(RuntimeError, 'prepared FX index'):
+                api.start()
+            launch.assert_not_called()
+
+    def test_ini_edit_preserves_non_utf8_path_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ini = Path(directory) / 'reaper.ini'
+            original = b'[REAPER]\r\nvst_scan=2\r\npath=' + 'テスト'.encode('cp932') + b'\r\n'
+            ini.write_bytes(original)
+            api.set_reaper_ini_options(ini, {'vst_scan': '1'})
+            self.assertEqual(ini.read_bytes(), original.replace(b'vst_scan=2', b'vst_scan=1'))
+
+    def test_only_opted_in_fx_cache_is_copied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            for name in ['reaper-vstplugins64.ini', 'reaper-license.rk', 'reaper-reginfo2.ini', 'reaper.ini']:
+                (source / name).write_text('synthetic test fixture', encoding='utf-8')
+            resource = root / 'isolated'
+            with patch.object(api, 'RESOURCE', resource), patch.object(api, 'QUEUE', root / 'queue'), \
+                    patch.object(api, 'config', return_value={'target': {'pluginCacheSource': str(source)}}):
+                api.initialize_resource()
+            self.assertTrue((resource / 'reaper-vstplugins64.ini').exists())
+            self.assertFalse((resource / 'reaper-license.rk').exists())
+            self.assertFalse((resource / 'reaper-reginfo2.ini').exists())
+            self.assertIn('loadlastproj=0', (resource / 'reaper.ini').read_text())
+            self.assertEqual((source / 'reaper.ini').read_text(), 'synthetic test fixture')
+
+    def test_configuration_is_not_overwritten(self):
+        import configure
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'config').mkdir()
+            config = root / 'config/local.json'
+            config.write_text('{"keep": true}', encoding='utf-8')
+            (root / 'reaper-vstplugins64.ini').write_text('[vstcache]\nsynthetic.dll=0,1,Test\n')
+            with patch.object(configure, 'ROOT', root), \
+                    patch.object(sys, 'argv', ['configure.py', '--reaper', sys.executable, '--plugin-cache-source', str(root)]), \
+                    patch('sys.stderr'), self.assertRaises(SystemExit):
+                configure.main()
+            self.assertEqual(config.read_text(), '{"keep": true}')
+
+
+if __name__ == '__main__':
+    unittest.main()
