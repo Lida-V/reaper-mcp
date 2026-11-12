@@ -60,3 +60,32 @@ No commercial plugin binaries, caches, licenses, original user profile, or produ
 macOS/Linux and exhaustive client/plugin compatibility have not been tested.
 
 Configuration reference: [Ultraschall's REAPER configuration-variable documentation](https://mespotin.uber.space/Ultraschall/Reaper_Config_Variables.html#vst_scan). The live results above are local observations.
+
+## 0.2.0 (2026-11-13): worker states, later results, render guard
+
+Tested on Windows 11, REAPER 7.81 x64, Python 3.13.
+
+| Check | Result |
+| --- | --- |
+| `python -m unittest discover -s tests` (no REAPER) | 13 passed |
+| Job of 9 s polled at 7 s | `state=busy`, `responsive=false`, matching `job_id` |
+| `start` and `run_lua` while busy | Refused; no second process |
+| Result fetched after a 2 s timeout of a 4 s job | `job_result` returned it; nothing was resent |
+| Six jobs submitted in a row | Ran in submission order |
+| Wrong pinned project / `"*"` / `""` | Refused / passed / passed |
+| Render to an existing target without `overwrite` | Error in 0.6 s, no dialog |
+| Render with `overwrite=true` (action 42230) | File rewritten, 48 kHz 24-bit stereo, non-silent |
+| Leftover `.request.lua` and `.running.lua` at start | Not executed; reported `cancelled` / `orphaned` |
+| 4,608 finished queue files at start | Moved to `queue/done/`; scanned folder empty |
+| Stop | Process exit confirmed before returning |
+
+These live checks ran the same transport and bridge code in a dedicated profile that was already set up.
+`tests/smoke_reaper.py` was extended with the render guard, the busy state and the later result, but its run in this checkout's own profile did not complete:
+REAPER opened a dialog during startup and never loaded the bridge. `reaper_status` reported `stalled` and a second start was refused, as designed.
+That profile had last been started two months earlier with an older REAPER version; the dialog was not identified. Run the first start of a profile with `--show-window`.
+
+Limits found in this round:
+
+- A dialog cannot be dismissed through this server. During a job it shows as `busy`, outside a job as `stalled`.
+- With `vst_scan=1` and a prepared index, REAPER still added one newly installed plugin to the index at startup. Later starts left the index byte-identical. Startup therefore avoids a full scan, not every load of a plugin that is new since the index was prepared.
+- The 600-second limits apply to a single wait. A longer render is waited for with repeated `reaper_job_result` calls; a render of several minutes was not part of this round.

@@ -80,12 +80,31 @@ reaper.GetSetProjectInfo_String(0,'RENDER_FILE',OUTPUT,true)
 reaper.GetSetProjectInfo_String(0,'RENDER_PATTERN','smoke',true)
 reaper.UpdateArrange()
 reaper.Main_SaveProjectEx(0,PROJECT,8)
-reaper.Main_OnCommand(42230,0)
+local rendered=REAPER_SUPPORTER_RENDER()
 reaper.Main_SaveProjectEx(0,PROJECT,8)
-return {fx_parameters=count,notes=1,version=reaper.GetAppVersion()}
+return {fx_parameters=count,notes=1,version=reaper.GetAppVersion(),rendered=rendered}
 '''.replace('OUTPUT', lua_string(output)).replace('PROJECT', lua_string(project))
         result = tool('reaper_run_lua', code=code, timeout_seconds=120, expected_project='')
         assert project.is_file(), 'Project was not saved'
+        assert result['project'].replace('\\', '/').lower() == str(project).replace('\\', '/').lower(), result['project']
+        # An existing target must be an immediate error, never an overwrite dialog that blocks the worker.
+        blocked_at = time.monotonic()
+        exists = rpc('tools/call', {'name': 'reaper_run_lua', 'arguments': {
+            'code': 'return REAPER_SUPPORTER_RENDER()', 'timeout_seconds': 60, 'expected_project': str(project)}})
+        assert exists['isError'] and 'Render target exists' in exists['content'][0]['text'], exists
+        assert time.monotonic() - blocked_at < 10
+        tool('reaper_run_lua', code='return REAPER_SUPPORTER_RENDER({overwrite=true})', timeout_seconds=120,
+             expected_project=str(project))
+        # A job longer than the caller waits for: busy (not stopped), no duplicate start, result fetched later.
+        job = tool('reaper_submit_lua', expected_project=str(project),
+                   code='local t=reaper.time_precise(); while reaper.time_precise()-t<8 do end; return "slept"')['job_id']
+        time.sleep(6.5)
+        busy = tool('reaper_status')
+        assert busy['state'] == 'busy' and not busy['responsive'] and busy['job_id'] == job, busy
+        second = rpc('tools/call', {'name': 'reaper_start', 'arguments': {}})
+        assert second['isError'] and 'No second instance' in second['content'][0]['text'], second
+        finished = tool('reaper_job_result', job_id=job, wait_seconds=30)
+        assert finished['state'] == 'done' and finished['result'] == 'slept', finished
         with wave.open(str(output / 'smoke.wav'), 'rb') as audio:
             channels, width, rate, frames = audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getnframes()
             samples = audio.readframes(frames)
@@ -94,18 +113,21 @@ return {fx_parameters=count,notes=1,version=reaper.GetAppVersion()}
         assert channels == 2 and rate == 48000 and width == 3, (channels, rate, width)
         assert 1.9 <= frames / rate <= 2.1 and 0.001 < peak < 0.99, (frames / rate, peak)
         tool('reaper_run_lua', code='return {tracks=reaper.CountTracks(0)}', expected_project=str(project))
-        dirty = tool('reaper_run_lua', code="reaper.GetSetMediaTrackInfo_String(reaper.GetTrack(0,0),'P_NAME','MCP changed',true); reaper.MarkProjectDirty(0); return true")
+        dirty = tool('reaper_run_lua', expected_project=str(project), code="reaper.GetSetMediaTrackInfo_String(reaper.GetTrack(0,0),'P_NAME','MCP changed',true); reaper.MarkProjectDirty(0); return true")
         refused = rpc('tools/call', {'name': 'reaper_stop', 'arguments': {}})
         assert refused['isError'], 'Unsaved project should prevent shutdown'
-        tool('reaper_run_lua', code='reaper.Main_SaveProject(0,false); return true')
-        tool('reaper_stop')
+        tool('reaper_run_lua', expected_project=str(project), code='reaper.Main_SaveProject(0,false); return true')
+        stopped = tool('reaper_stop')
+        assert stopped['exited'], 'REAPER process did not exit'
         final_status = tool('reaper_status')
-        assert not final_status['responsive'], 'Worker did not stop'
+        assert final_status['state'] == 'not_started', final_status
         report = {'passed': True, 'reaper': result['result']['version'], 'channels': channels,
                   'startup_seconds': round(boot_seconds, 3),
                   'sample_rate': rate, 'bit_depth': width * 8, 'duration_seconds': frames / rate,
                   'peak_linear': peak, 'project_guard': 'passed', 'dirty_stop_guard': 'passed',
-                  'fx_parameter_readback': 'passed', 'mcp_transport': 'passed'}
+                  'fx_parameter_readback': 'passed', 'mcp_transport': 'passed',
+                  'existing_render_target_guard': 'passed', 'busy_state_and_job_result': 'passed',
+                  'duplicate_start_guard': 'passed'}
         (output / 'validation.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         print(json.dumps(report, indent=2))
     finally:
